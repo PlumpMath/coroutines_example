@@ -1,83 +1,133 @@
 #include <deque>
-#include <future>
-#include <map>
-#include <string>
-#include <thread>
+#include <vector>
 #include <iostream>
+#include <memory>
+#include <thread>
 
-std::map<std::string, std::string> db = 
-   {
-      {"Hola Don Pepito", "Hola Don Jose"},
-      {"Vio usted a mi abuela", "A su abuela yo la vi"},
-      {"Adios Don Pepito", "Adios Don Jose"},
-   };
+#include <boost/optional.hpp>
 
-struct context_t{
-   std::string incoming;
-   std::promise<std::string> outgoing;
-}; 
-
-struct conversation_t
+struct TaskContext
 {
-   conversation_t(const std::string& _answer)
-   :answer(_answer)
-   {}
-   
-   std::string answer;
-   std::future<std::string> response;
+   std::string msg;
 };
 
-class audience_t
+enum class TaskReturnCode { SUCCESS, FAIL, SUSPENDED };
+
+struct TaskIf
+{
+   virtual TaskReturnCode run(TaskContext&) = 0;
+};
+
+struct NormalTask : public TaskIf
+{
+   TaskReturnCode run(TaskContext& ctx)
+   {
+      std::cout << "work: " << ctx.msg << ", type: NormalTask" << std::endl;
+      return TaskReturnCode::SUCCESS;
+   }
+};
+
+class SuspendedTask : public TaskIf
 {
 public:
-   
-   std::future<std::string> say(const std::string& message)
-   {
-      context_t context;
-      context.incoming = message;
-      messages.push_back(context);
-      return std::move(context.outgoing.get_future());
-   }
+   SuspendedTask()
+   :returnCode(TaskReturnCode::SUSPENDED)
+   {}
 
-   void listen()
+   TaskReturnCode run(TaskContext& ctx)
    {
-      std::thread worker([this]{
-         for (auto& message : messages)
-         {
-            sleep_and_append(message);
-         }
-      });
+      if (not deferredThread)
+      {
+         deferredThread = std::thread([this, &ctx]{
+            sleep(10);
+            std::cout << "work: " << ctx.msg << ", type: SuspendedTask" << std::endl;
+            returnCode = TaskReturnCode::SUCCESS;
+         });
+      }
+      return returnCode;
+   }
+   
+   ~SuspendedTask()
+   {
+      if (deferredThread)
+      {
+         deferredThread.get().join();
+      }
    }
 private:
-   void sleep_and_append(context_t& ctx)
-   {
-      sleep(5);
-      ctx.outgoing.set_value(db.at(ctx.incoming));         
-   }
-   std::deque<std::reference_wrapper<context_t>> messages;
+   boost::optional<std::thread> deferredThread;
+   std::atomic<TaskReturnCode> returnCode;
 };
 
 
-int main()
+using Tasks = std::vector<std::shared_ptr<TaskIf>>;
+
+struct TasksRunnerContext
 {
+   TaskContext taskContext;
+   Tasks tasks;
+   Tasks::size_type resumePoint;
+};
 
-   audience_t audience;
+struct TasksRunner
+{
+   std::deque<TasksRunnerContext> pendingWork;
 
-   std::deque<conversation_t> conversations;
-
-   conversations.emplace_back("Hola Don Pepito");
-   conversations.emplace_back("Vio usted a mi abuela");
-   conversations.emplace_back("Adios Don Pepito");
-
-   for (auto& conversation: conversations)
+   void scheduleWork(TaskContext& taskContext)
    {
-      conversation.response = audience.say(conversation.answer);
+      TasksRunnerContext tasksRunnerContext;
+      tasksRunnerContext.taskContext = taskContext;
+      tasksRunnerContext.tasks.emplace_back(new NormalTask());
+      tasksRunnerContext.tasks.emplace_back(new SuspendedTask());
+      tasksRunnerContext.tasks.emplace_back(new NormalTask());
+      tasksRunnerContext.resumePoint = 0;
+
+      pendingWork.emplace_back(tasksRunnerContext); 
    }
-   
-   audience.listen();
 
-   for (auto& conversation: conversations)
+   bool doWork()
    {
-      std::cout << conversation.response.get() << std::endl;   
+      auto work = pendingWork.front();
+      pendingWork.pop_front();
+      auto resultCode = runTasks(work);
+      if (resultCode == TaskReturnCode::SUSPENDED)
+      {
+         pendingWork.push_back(work);
+      }
+      return not pendingWork.empty();
+   }
+
+   TaskReturnCode runTasks(TasksRunnerContext& work)
+   {
+      for(;work.resumePoint < work.tasks.size(); ++work.resumePoint)
+      {
+         auto& task = work.tasks[work.resumePoint];
+         auto returnCode= task->run(work.taskContext);
+         if (returnCode == TaskReturnCode::SUSPENDED) 
+            return TaskReturnCode::SUSPENDED;
+      }
+      return TaskReturnCode::SUCCESS;
+   }
+};
+
+
+
+int main(void)
+{
+   TasksRunner tasksRunner;
+   
+   TaskContext ctx1{"foo"};
+   TaskContext ctx2{"bar"};
+   TaskContext ctx3{"dar"};
+
+   tasksRunner.scheduleWork(ctx1);
+   tasksRunner.scheduleWork(ctx2);
+   tasksRunner.scheduleWork(ctx3);
+   
+   bool workPending = true;
+
+   while (workPending)
+   {
+      workPending = tasksRunner.doWork();
    }
 }
